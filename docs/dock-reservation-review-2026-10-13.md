@@ -29,9 +29,9 @@ fractions, and exercise the real move candidate search to reject the synthetic
 trailing gap. Existing shrink/grow, external-margin, settings-only retry,
 disable/re-enable and unload coverage also passes.
 
-This follow-up changes the upstream submission after the companion 1.7.2 release.
-The published v1.7.2 tag and release asset remain unchanged and do not contain
-this follow-up. Live Explorer with the reporters' exact themes and physical
+This follow-up was developed after the initial companion 1.7.2 release and
+was subsequently included in the October 13, 2026 refresh of its tag and asset.
+Live Explorer with the reporters' exact themes and physical
 mixed-DPI monitor transfers remain unverified.
 
 ## Second review: switching themes
