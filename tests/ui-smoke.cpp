@@ -434,7 +434,9 @@ int wmain(int argc, wchar_t** argv) {
                                   WidgetLayoutMode::CompactTwoRows, WidgetLayoutMode::CompactOneRow}) {
                     auto layout = BuildWidgetLayout(*network, MeasureWidgetFont(*network), mode, 48);
                     ApplyWidgetGeometry(*network, layout);
-                    frame.UpdateLayout(); Pump();
+                    g_widget.Measure(Size{static_cast<float>(layout.width), static_cast<float>(layout.height)});
+                    g_widget.Arrange(Rect{0, 0, static_cast<float>(layout.width), static_cast<float>(layout.height)});
+                    g_widget.UpdateLayout();
                     for (auto text : {g_netDownText, g_netUpText}) {
                         if (text.Text() == L"--" || text.ActualWidth() <= 0 ||
                             text.DesiredSize().Width > text.ActualWidth() + .1)
