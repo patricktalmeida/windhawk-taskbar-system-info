@@ -441,7 +441,7 @@ int wmain(int argc, wchar_t** argv) {
                             throw std::runtime_error("Network value is missing or clipped");
                     }
                     WidgetPreviewFrame preview; CaptureWidgetPreview(&preview);
-                    ArrangeWidgetPreview(preview, layout);
+                    ArrangeWidgetPreview(preview, layout, *network);
                     if (preview.texts.size() != 16 || preview.texts[13].bounds.Width <= 0)
                         throw std::runtime_error("Network preview lost rate cells");
                 }
