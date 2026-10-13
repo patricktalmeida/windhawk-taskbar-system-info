@@ -3567,19 +3567,17 @@ struct NetworkCounterState {
 };
 NetworkCounterState g_networkCounters;
 
-void ReadNetwork(MetricsSnapshot& snapshot) {
-    MIB_IF_TABLE2* table = nullptr;
-    if (GetIfTable2(&table) != NO_ERROR || !table) {
-        g_networkCounters = {};
-        return;
-    }
-    auto now = SampleTime::clock::now();
-    std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> current;
-    uint64_t received = 0, sent = 0;
-    for (ULONG i = 0; i < table->NumEntries; ++i) {
-        const MIB_IF_ROW2& row = table->Table[i];
-        // Physical adapters only: virtual switches, VPN tunnels and filter
-        // layers repeat traffic that already crosses a hardware interface.
+void AccumulateNetworkSample(MetricsSnapshot& snapshot,
+                             NetworkCounterState& state,
+                             const MIB_IF_ROW2* rows, size_t count,
+                             SampleTime now) {
+    snapshot.netAvailable = false;
+    snapshot.netDownBytes = snapshot.netUpBytes = 0;
+    decltype(state.previous) current;
+    double received = 0, sent = 0;
+    bool comparable = false;
+    for (size_t i = 0; i < count; ++i) {
+        const auto& row = rows[i];
         if (!row.InterfaceAndOperStatusFlags.HardwareInterface ||
             row.InterfaceAndOperStatusFlags.FilterInterface ||
             row.OperStatus != IfOperStatusUp ||
@@ -3587,25 +3585,38 @@ void ReadNetwork(MetricsSnapshot& snapshot) {
             continue;
         }
         current[row.InterfaceLuid.Value] = {row.InOctets, row.OutOctets};
-        auto it = g_networkCounters.previous.find(row.InterfaceLuid.Value);
-        // A reset or newly connected adapter contributes from its next sample.
-        if (it != g_networkCounters.previous.end() &&
+        auto it = state.previous.find(row.InterfaceLuid.Value);
+        // Missing/reset adapters establish a baseline, never a false zero.
+        if (it != state.previous.end() &&
             row.InOctets >= it->second.first &&
             row.OutOctets >= it->second.second) {
-            received += row.InOctets - it->second.first;
-            sent += row.OutOctets - it->second.second;
+            comparable = true;
+            received += static_cast<double>(row.InOctets - it->second.first);
+            sent += static_cast<double>(row.OutOctets - it->second.second);
         }
     }
-    FreeMibTable(table);
-    double seconds =
-        std::chrono::duration<double>(now - g_networkCounters.time).count();
-    if (g_networkCounters.time != SampleTime{} && seconds >= 0.2) {
-        snapshot.netDownBytes = static_cast<double>(received) / seconds;
-        snapshot.netUpBytes = static_cast<double>(sent) / seconds;
+    double seconds = std::chrono::duration<double>(now - state.time).count();
+    if (comparable && state.time != SampleTime{} && seconds >= 0.2) {
+        snapshot.netDownBytes = received / seconds;
+        snapshot.netUpBytes = sent / seconds;
         snapshot.netAvailable = true;
     }
-    g_networkCounters.previous = std::move(current);
-    g_networkCounters.time = now;
+    state.previous = std::move(current);
+    state.time = now;
+}
+
+void ReadNetwork(MetricsSnapshot& snapshot) {
+    MIB_IF_TABLE2* table = nullptr;
+    if (GetIfTable2(&table) != NO_ERROR || !table) {
+        g_networkCounters = {};
+        snapshot.netAvailable = false;
+        snapshot.netDownBytes = snapshot.netUpBytes = 0;
+        return;
+    }
+    // Release the API allocation even if building the baseline throws.
+    std::unique_ptr<MIB_IF_TABLE2, decltype(&FreeMibTable)> owner(table, FreeMibTable);
+    AccumulateNetworkSample(snapshot, g_networkCounters, table->Table,
+                            table->NumEntries, SampleTime::clock::now());
 }
 
 MetricsSnapshot CollectMetrics(const ModSettings& settings) {

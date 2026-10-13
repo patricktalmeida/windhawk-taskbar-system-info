@@ -207,6 +207,44 @@ void AdaptivePlacement() {
           "a zero configured reservation gap still retains six DIP visual clearance");
 }
 
+void NetworkSampling() {
+    NetworkCounterState state;
+    MetricsSnapshot sample;
+    auto now = SampleTime::clock::now();
+    auto read = [&](const std::vector<MIB_IF_ROW2>& rows, double seconds = 1) {
+        now += std::chrono::duration_cast<SampleTime::duration>(std::chrono::duration<double>(seconds));
+        AccumulateNetworkSample(sample, state, rows.data(), rows.size(), now);
+    };
+    MIB_IF_ROW2 row{};
+    row.InterfaceLuid.Value = 1; row.Type = IF_TYPE_ETHERNET_CSMACD;
+    row.OperStatus = IfOperStatusUp;
+    row.InterfaceAndOperStatusFlags.HardwareInterface = 1;
+    row.InOctets = 10000; row.OutOctets = 20000;
+    read({}); read({}); Check(!sample.netAvailable, "empty network table stays unavailable");
+    read({row}); Check(!sample.netAvailable, "first physical sample establishes baseline");
+    row.InOctets += 4096; row.OutOctets += 2048; read({row}, 2);
+    Check(sample.netAvailable && Near(sample.netDownBytes, 2048) && Near(sample.netUpBytes, 1024), "network deltas use elapsed time");
+    read({row}); Check(sample.netAvailable && sample.netDownBytes == 0, "idle supported adapter is a valid zero");
+    row.InOctets = 1; read({row}); Check(!sample.netAvailable, "counter reset establishes new baseline");
+    row.InOctets += 100; read({row}); Check(sample.netAvailable && Near(sample.netDownBytes, 100), "reset adapter recovers");
+    read({}); read({row}); Check(!sample.netAvailable, "reconnected adapter cannot reuse pre-disconnect counters");
+    auto other = row; other.InterfaceLuid.Value = 2;
+    read({row, other}); row.InOctets += 100; other.InOctets += 200; read({row, other});
+    Check(sample.netAvailable && Near(sample.netDownBytes, 300), "physical interfaces aggregate once");
+    for (int filter = 0; filter < 4; ++filter) {
+        state = {}; auto excluded = row;
+        if (filter == 0) excluded.InterfaceAndOperStatusFlags.HardwareInterface = 0;
+        if (filter == 1) excluded.InterfaceAndOperStatusFlags.FilterInterface = 1;
+        if (filter == 2) excluded.OperStatus = IfOperStatusDown;
+        if (filter == 3) excluded.Type = IF_TYPE_SOFTWARE_LOOPBACK;
+        read({excluded}); read({excluded});
+        Check(!sample.netAvailable && state.previous.empty(), "excluded adapters do not masquerade as idle hardware");
+    }
+    state = {}; read({row}); row.InOctets += 100; read({row}, .1);
+    Check(!sample.netAvailable, "too-short sample is unavailable");
+    read({row}); Check(sample.netAvailable && sample.netDownBytes == 0, "short sample rebases counters");
+}
+
 void NetworkLayouts() {
     Check(FormatNetworkRate(0, false, false) == L"--" && FormatNetworkRate(-1, true, false) == L"--",
           "an unavailable network rate is not shown as zero");
@@ -1535,6 +1573,7 @@ int main() {
         std::cout << "PASS: adaptive placement, DPI matrix, reservation bounds and restoration\n";
         ResponsiveLayouts();
         std::cout << "PASS: responsive layouts, essential fields and destination preview matrix\n";
+        NetworkSampling();
         NetworkLayouts();
         std::cout << "PASS: network rate formatting, appended column bounds and preview layout\n";
         PlacementConfirmationMatrix();
