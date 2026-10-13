@@ -173,6 +173,131 @@ int wmain(int argc, wchar_t** argv) {
         // started in this fixture, and only synthetic snapshots are published.
         g_metricsWorker.emplace();
         if (!InjectWidget(frame)) throw std::runtime_error("InjectWidget failed");
+        // A dock measures to its buttons, unlike the fixed-width fixtures below.
+        // Reserving space must grow this auto-sized frame from a cold injection.
+        {
+            if (!RemoveWidget()) throw std::runtime_error("Dock setup cleanup failed");
+            Grid scene, dockFrame, dockRoot, dockButtons;
+            scene.Width(1200); scene.Height(48);
+            scene.Background(SolidColorBrush(Color{255, 20, 20, 20}));
+            scene.RequestedTheme(ElementTheme::Dark);
+            dockFrame.HorizontalAlignment(HorizontalAlignment::Center);
+            dockRoot.Name(L"RootGrid");
+            dockRoot.Background(SolidColorBrush(Color{255, 45, 45, 45}));
+            dockButtons.Name(L"TaskbarFrameRepeater");
+            dockButtons.HorizontalAlignment(HorizontalAlignment::Left);
+            Button dockButton; dockButton.Width(300); dockButton.Height(38);
+            dockButton.Content(box_value(L"Start / app buttons (test fixture)"));
+            dockButtons.Children().Append(dockButton);
+            dockRoot.Children().Append(dockButtons);
+            dockFrame.Children().Append(dockRoot); scene.Children().Append(dockFrame);
+            island.Content(scene);
+            SetWindowPos(child, nullptr, 0, 0, 1200, 48, SWP_NOZORDER | SWP_NOACTIVATE);
+            auto dockSettings = std::make_shared<ModSettings>(*initialSettings);
+            dockSettings->reserveSpace = true; dockSettings->leftOffset = 10;
+            g_settings = dockSettings;
+            auto settleDock = [&] {
+                for (int i = 0; i < 12; ++i) {
+                    scene.Measure(Size{1200, 48}); scene.Arrange(Rect{0, 0, 1200, 48});
+                    scene.UpdateLayout(); Pump(); ApplyTaskbarPlacement(*dockSettings);
+                }
+            };
+            settleDock();
+            if (!InjectWidget(dockFrame)) throw std::runtime_error("Dock injection failed");
+            settleDock();
+            std::wcout << L"DOCK root=" << dockRoot.ActualWidth() << L" widget="
+                       << g_widgetHost.Width() << L" reserve=" << g_reservedMargin << L"\n";
+            SaveImage(scene, argv[1], L"dock-reservation.png");
+            if (g_widgetHost.Visibility() != Visibility::Visible || g_widgetHost.ActualWidth() <= 0 ||
+                !PlacementFits(MeasureTaskbarGeometry(dockRoot, dockButtons),
+                               {g_widgetHost.Margin().Left, g_widgetHost.Width(), 0}))
+                throw std::runtime_error("Auto-sized dock cannot reserve space from a cold injection");
+            if (!g_widgetHost.try_as<Grid>())
+                throw std::runtime_error("Grid#WindhawkTaskbarSystemInfo theme selector no longer matches");
+            double dockWidth = dockRoot.ActualWidth(), dockMargin = dockButtons.Margin().Left;
+            settleDock();
+            if (std::abs(dockRoot.ActualWidth() - dockWidth) > .1 ||
+                std::abs(dockButtons.Margin().Left - dockMargin) > .1)
+                throw std::runtime_error("Auto-sized dock does not settle");
+            // DockLike uses padding; other presets add a border as well.
+            dockRoot.Padding(Thickness{6, 2, 6, 2});
+            dockRoot.BorderThickness(Thickness{1, 1, 1, 1});
+            settleDock();
+            auto widgetBounds = g_widgetHost.TransformToVisual(dockRoot).TransformBounds(
+                {0, 0, static_cast<float>(g_widgetHost.ActualWidth()), static_cast<float>(g_widgetHost.ActualHeight())});
+            auto buttonBounds = dockButton.TransformToVisual(dockRoot).TransformBounds(
+                {0, 0, static_cast<float>(dockButton.ActualWidth()), static_cast<float>(dockButton.ActualHeight())});
+            if (g_widgetHost.Visibility() != Visibility::Visible ||
+                widgetBounds.X + widgetBounds.Width + kTaskbarClearance > buttonBounds.X + .25 ||
+                widgetBounds.Y < 3 - .25 || widgetBounds.Y + widgetBounds.Height > 45 + .25)
+                throw std::runtime_error("Dock padding/border breaks the actual widget clearance");
+            dockRoot.Padding(Thickness{}); dockRoot.BorderThickness(Thickness{});
+            dockSettings->reserveSpace = false; settleDock();
+            if (dockButtons.Margin().Left != 0)
+                throw std::runtime_error("Disabling dock reservation retained its margin");
+            dockSettings->reserveSpace = true; settleDock();
+            if (g_widgetHost.Visibility() != Visibility::Visible)
+                throw std::runtime_error("Re-enabling dock reservation did not restore the widget");
+            if (!RemoveWidget()) throw std::runtime_error("Dock cleanup failed");
+            settleDock();
+            if (std::abs(dockRoot.ActualWidth() - 300) > .1 || dockButtons.Margin().Left != 0)
+                throw std::runtime_error("Dock unload did not restore its original size and margin");
+            // The parent's constraint is intentionally smaller than XamlRoot:
+            // a proposed expansion must be rejected against arranged controls.
+            scene.Width(400);
+            if (!InjectWidget(dockFrame)) throw std::runtime_error("Constrained dock injection failed");
+            settleDock();
+            if (g_widgetHost.Visibility() != Visibility::Collapsed || g_reservedMargin != 0 ||
+                dockButtons.Margin().Left != 0 || g_dockReservationTrial)
+                throw std::runtime_error("Rejected dock growth did not roll back");
+            auto stableRevision = g_layoutRevision;
+            settleDock();
+            if (g_layoutRevision != stableRevision)
+                throw std::runtime_error("Rejected dock growth keeps retrying layout");
+            scene.Width(1200); settleDock();
+            if (g_widgetHost.Visibility() != Visibility::Visible || g_reservedMargin <= 0)
+                throw std::runtime_error("Growing the parent did not retry a hidden dock widget");
+            if (!RemoveWidget()) throw std::runtime_error("Constrained dock cleanup failed");
+            settleDock();
+            if (!InjectWidget(dockFrame) || !g_dockReservationTrial)
+                throw std::runtime_error("Expected a pending cold dock reservation");
+            // A theme may override the requested margin before arrangement.
+            dockButtons.Margin(Thickness{}); settleDock();
+            if (!g_reservationRejected || g_reservedMargin != 0 ||
+                g_widgetHost.Visibility() != Visibility::Collapsed)
+                throw std::runtime_error("Theme-rejected dock reservation was not rolled back");
+            stableRevision = g_layoutRevision; settleDock();
+            if (g_layoutRevision != stableRevision)
+                throw std::runtime_error("Theme-rejected dock reservation entered a feedback loop");
+            if (!RemoveWidget()) throw std::runtime_error("Rejected dock cleanup failed");
+            Grid dockTray;
+            dockTray.Name(L"SystemTrayFrame"); dockTray.Width(120); dockTray.Height(48);
+            dockTray.HorizontalAlignment(HorizontalAlignment::Right);
+            scene.Children().Append(dockTray);
+            dockRoot.Padding(Thickness{6, 2, 6, 2});
+            dockRoot.BorderThickness(Thickness{1, 1, 1, 1});
+            settleDock();
+            if (!InjectWidget(dockFrame)) throw std::runtime_error("Padded dock injection failed");
+            settleDock();
+            auto dockGeometry = MeasureTaskbarGeometry(dockRoot, dockButtons);
+            if (g_widgetHost.Visibility() != Visibility::Visible || !ReservedControlsFit(dockGeometry) ||
+                !PlacementFits(dockGeometry, {g_widgetHost.Margin().Left, g_widgetHost.Width(), 0}))
+                throw std::runtime_error("Cold padded dock with a separate tray failed");
+            TaskbarProjection dockProjection; dockProjection.window = window;
+            ProbeTaskbarFrameGeometry(dockProjection, dockFrame);
+            POINT sceneOrigin{}; ClientToScreen(window, &sceneOrigin);
+            auto actualOrigin = g_widgetHost.TransformToVisual(scene).TransformPoint({0, 0});
+            double projectedX = dockProjection.origin.x + g_widgetHost.Margin().Left * dockProjection.scale;
+            double actualX = sceneOrigin.x + actualOrigin.X * dockProjection.scale;
+            if (!dockProjection.geometry.ready || std::abs(projectedX - actualX) > 1)
+                throw std::runtime_error("Padded dock move projection differs from the rendered widget");
+            SaveImage(scene, argv[1], L"dock-padding-and-tray.png");
+            if (!RemoveWidget()) throw std::runtime_error("Padded dock cleanup failed");
+            std::wcout << L"PASS: cold dock reservation, Grid selector, padding, rollback, resize recovery and unload\n";
+            island.Content(frame); g_settings = initialSettings;
+            SetWindowPos(child, nullptr, 0, 0, 520, 64, SWP_NOZORDER | SWP_NOACTIVATE);
+            if (!InjectWidget(frame)) throw std::runtime_error("Post-dock injection failed");
+        }
         struct Scenario { PCWSTR name; int width; int height; int font; bool light; bool unavailable; };
         const Scenario cases[] = {
             {L"dark-410x48.png", 410, 48, 11, false, false},

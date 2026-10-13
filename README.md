@@ -195,6 +195,12 @@ collide with another mapped element, the reservation is undone and the mod uses
 a free gap. **Reserved space gap** defaults to 8 logical pixels, with an effective
 minimum of 6. The mod does not reorder individual app buttons.
 
+On an automatically sized dock, reservation can first grow the button group's
+container. The widget appears only after the arranged controls confirm that it
+fits; a rejected expansion restores the original margin. Root padding and
+borders are excluded from the usable area. Taskbar Styler themes can target
+`Grid#WindhawkTaskbarSystemInfo`; adaptive scaling uses an inner `Viewbox`.
+
 Left and centered taskbar alignment use the same placement map. Separately drawn
 items or windows from another taskbar mod may need manual positioning or a
 compatibility fix. A particular Taskbar Styler preset still needs a live check.
