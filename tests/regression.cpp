@@ -243,6 +243,21 @@ void NetworkSampling() {
     state = {}; read({row}); row.InOctets += 100; read({row}, .1);
     Check(!sample.netAvailable, "too-short sample is unavailable");
     read({row}); Check(sample.netAvailable && sample.netDownBytes == 0, "short sample rebases counters");
+    fake::networkRows = {row}; g_networkCounters = {};
+    ReadNetwork(sample);
+    Check(!sample.netAvailable && fake::networkAllocations == fake::networkFrees, "API first sample releases its allocation");
+    fake::networkError = true; sample.netAvailable = true;
+    ReadNetwork(sample);
+    Check(!sample.netAvailable && g_networkCounters.previous.empty(), "API failure clears availability and baseline");
+    fake::networkError = false; ReadNetwork(sample);
+    Check(!sample.netAvailable, "recovery starts a new baseline");
+    g_networkCounters = {}; failNextAllocation = true;
+    bool allocationFailed = false;
+    try { ReadNetwork(sample); } catch (const std::bad_alloc&) { allocationFailed = true; }
+    failNextAllocation = false;
+    Check(allocationFailed && fake::networkAllocations == fake::networkFrees, "API table is released when baseline allocation throws");
+    fake::networkRows.clear(); g_networkCounters = {};
+
 }
 
 void NetworkLayouts() {
