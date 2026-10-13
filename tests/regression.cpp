@@ -207,6 +207,58 @@ void AdaptivePlacement() {
           "a zero configured reservation gap still retains six DIP visual clearance");
 }
 
+void NetworkLayouts() {
+    Check(FormatNetworkRate(0, false, false) == L"--" && FormatNetworkRate(-1, true, false) == L"--",
+          "an unavailable network rate is not shown as zero");
+    Check(FormatNetworkRate(0, true, false) == L"0.0 KB/s" && FormatNetworkRate(1536, true, false) == L"1.5 KB/s" &&
+          FormatNetworkRate(10 * 1024, true, false) == L"10 KB/s" && FormatNetworkRate(999.4 * 1024, true, false) == L"999 KB/s" &&
+          FormatNetworkRate(999.6 * 1024, true, false) == L"1.0 MB/s" && FormatNetworkRate(2.5 * 1024 * 1024 * 1024, true, false) == L"2.5 GB/s" &&
+          FormatNetworkRate(5e15, true, false) == L"999 GB/s",
+          "byte rates use 1024-based units and at most three digits");
+    Check(FormatNetworkRate(125, true, true) == L"1.0 Kbps" && FormatNetworkRate(125000, true, true) == L"1.0 Mbps" &&
+          FormatNetworkRate(12.5e6, true, true) == L"100 Mbps" && FormatNetworkRate(125e6, true, true) == L"1.0 Gbps",
+          "bit rates use 1000-based units");
+    ModSettings settings; settings.width = 410; settings.reserveSpace = false;
+    WidgetFontMetrics font;
+    double net = font.netLabel + font.netValue;
+    auto base = ResolveWidgetPlacement(settings, {2000, 48, {}, true}, {6, 6}, font);
+    Check(base.layout.net == 0 && base.layout.netCells[1].Width == 0 && Near(base.layout.width, 410),
+          "a hidden network column leaves the original layout unchanged");
+    settings.showNetwork = true;
+    auto normal = ResolveWidgetPlacement(settings, {2000, 48, {}, true}, {6, 6}, font);
+    Check(normal.layout.legacy && Near(normal.layout.width, 410 + kColumnGap + net) &&
+          Near(normal.placement.width, normal.layout.width) && normal.layout.groups == base.layout.groups &&
+          normal.layout.graphs[0].Width == base.layout.graphs[0].Width && !SameWidgetLayout(normal.layout, base.layout),
+          "the network column is appended after the configured width without squeezing other groups");
+    Check(Near(normal.layout.netCells[0].Y, 0) && normal.layout.netCells[2].Y > normal.layout.netCells[0].Y &&
+          Near(normal.layout.netCells[0].X, normal.layout.netCells[2].X) &&
+          Near(normal.layout.netCells[1].X + normal.layout.netCells[1].Width, normal.layout.width - kWidgetSidePadding),
+          "download and upload stack in two rows and end at the right padding");
+    for (auto mode : {WidgetLayoutMode::Full, WidgetLayoutMode::NoGraphs, WidgetLayoutMode::CompactTwoRows,
+                      WidgetLayoutMode::CompactOneRow}) {
+        auto layout = BuildWidgetLayout(settings, font, mode, mode == WidgetLayoutMode::CompactOneRow ? 20 : 48);
+        bool single = mode == WidgetLayoutMode::CompactOneRow;
+        for (const auto& cell : layout.netCells) {
+            Check(cell.Width > 0 && cell.X >= layout.cells[11].X + layout.cells[11].Width - .01 &&
+                  cell.X + cell.Width <= layout.width - kWidgetSidePadding + .01 && cell.Y >= 0 &&
+                  cell.Y + cell.Height <= layout.height + .01,
+                  "network cells stay inside every adaptive layout, after the memory group");
+        }
+        Check(single ? Near(layout.netCells[2].Y, 0) && layout.netCells[2].X > layout.netCells[1].X
+                     : layout.netCells[2].Y > 0 && Near(layout.netCells[2].X, layout.netCells[0].X),
+              "one-row layouts place upload after download; two-row layouts stack them");
+    }
+    auto tight = ResolveWidgetPlacement(settings, {410 + 12, 48, {}, true}, {6, 6}, font);
+    Check(tight.placement.width > 0 && !tight.layout.legacy && tight.layout.net > 0 && Near(tight.layout.scale, 1),
+          "a gap that only fits the original width falls back to an adaptive layout with the network column");
+    MoveEditorState editor; editor.visual.fontMetrics = font;
+    editor.target.geometry = {2000, 48, {}, true}; editor.target.scale = 1.5; editor.candidate = normal.placement;
+    auto held = g_settings; g_settings = std::make_shared<ModSettings>(settings);
+    auto preview = ResolveMovePreviewLayout(editor, {0, 0, 4000, 2000});
+    g_settings = held;
+    Check(SameWidgetLayout(preview.widget, normal.layout), "the move preview shares the network layout");
+}
+
 void ResponsiveLayouts() {
     ModSettings settings; settings.width = 410; settings.reserveSpace = false;
     WidgetFontMetrics font;
@@ -1483,6 +1535,8 @@ int main() {
         std::cout << "PASS: adaptive placement, DPI matrix, reservation bounds and restoration\n";
         ResponsiveLayouts();
         std::cout << "PASS: responsive layouts, essential fields and destination preview matrix\n";
+        NetworkLayouts();
+        std::cout << "PASS: network rate formatting, appended column bounds and preview layout\n";
         PlacementConfirmationMatrix();
         std::cout << "PASS: 100000 generated placement/serialization/confirmation cases\n";
         DraggedLayouts();
