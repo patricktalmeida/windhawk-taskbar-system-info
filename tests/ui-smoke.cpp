@@ -118,6 +118,134 @@ void SaveNativePreview(HWND window, const std::wstring& folderPath, PCWSTR name)
     Finish(encoder.FlushAsync()); stream.Close();
 }
 
+
+struct SecondaryTestContext {
+    std::shared_ptr<const ModSettings> settings;
+    std::shared_ptr<const WidgetPresentation> model;
+    std::wstring folder;
+    std::string error;
+};
+void SecondaryUiChecks(const std::wstring& folder,
+                       std::shared_ptr<const ModSettings> settings,
+                       std::shared_ptr<const WidgetPresentation> model) {
+    struct Context : SecondaryTestContext { HWND window = nullptr; } context;
+    context.settings = settings; context.model = model; context.folder = folder;
+    std::atomic<bool> ready{false};
+    std::thread owner([&] {
+        try {
+            winrt::init_apartment(winrt::apartment_type::single_threaded);
+            auto manager = Windows::UI::Xaml::Hosting::WindowsXamlManager::InitializeForCurrentThread();
+            HWND window = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0,0,1800,48,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+            auto island = Windows::UI::Xaml::Hosting::DesktopWindowXamlSource();
+            auto native = island.as<IDesktopWindowXamlSourceNative>();
+            check_hresult(native->AttachToWindow(window));
+            HWND child = nullptr; check_hresult(native->get_WindowHandle(&child));
+            SetWindowPos(child,nullptr,0,0,1800,48,SWP_NOZORDER|SWP_NOACTIVATE|SWP_SHOWWINDOW);
+            Grid root; root.Width(1800); root.Height(48);
+            root.Name(L"RootGrid"); root.RequestedTheme(ElementTheme::Light);
+            root.Background(SolidColorBrush(Color{255,242,242,242}));
+            island.Content(root); SetWindowLongPtrW(window,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&root));
+            context.window=window; ready=true;
+            MSG message;
+            while (GetMessageW(&message,nullptr,0,0)>0) {
+                if (message.message == WM_APP + 73) break;
+                TranslateMessage(&message); DispatchMessageW(&message);
+            }
+            RemoveWidgetCopy(window);
+            island.Content(nullptr); island.Close(); DestroyWindow(window);
+            manager.Close(); Pump();
+        } catch (const winrt::hresult_error& e) {
+            context.error="secondary thread XAML failure " + std::to_string(static_cast<unsigned>(e.code())); ready=true;
+        } catch (const std::exception& e) { context.error=e.what(); ready=true; }
+    });
+    while (!ready) { Pump(); Sleep(1); }
+    if (context.window && context.error.empty()) {
+        auto check = [](void* value) {
+            auto& test = *static_cast<Context*>(value);
+            std::string stage="root";
+            try {
+                auto& root = *reinterpret_cast<Grid*>(GetWindowLongPtrW(test.window,GWLP_USERDATA));
+                auto settle = [&] { root.Measure(Size{1800,48}); root.Arrange(Rect{0,0,1800,48}); root.UpdateLayout(); Pump(); };
+                settle();
+                stage="attach";
+                auto* copy=AttachSecondaryWidget(test.window,root);
+                if (!copy) throw std::runtime_error("secondary attach failed");
+                copy->settings=test.settings; copy->model=test.model;
+                stage="update"; UpdateSecondaryWidget(*copy,true); stage="settle"; settle();
+                if (copy->view.host.Name()!=kWidgetName || copy->view.host.Visibility()!=Visibility::Visible)
+                    throw std::runtime_error("secondary public selector/visibility lost");
+                auto color=copy->palette[0].Color();
+                if (color.R!=0 || color.G!=95 || color.B!=184)
+                    throw std::runtime_error("secondary light theme inherited primary dark colors");
+                if (copy->view.texts[1].Text()!=FormatPercent(test.model->metrics.cpu))
+                    throw std::runtime_error("secondary values differ from shared snapshot");
+                // Bitmap export is tested on the primary XAML thread below.
+                stage="obstacle";
+                Button obstacle; obstacle.Width(650); obstacle.Height(48);
+                obstacle.HorizontalAlignment(HorizontalAlignment::Left); root.Children().Append(obstacle);
+                // Only layout events and the owning window queue may relocate it.
+                for(int i=0;i<4;++i) settle();
+                auto geometry=MeasureTaskbarGeometry(root,nullptr);
+                if (!PlacementFits(geometry,{copy->view.host.Margin().Left,copy->view.host.Width(),0}))
+                    throw std::runtime_error("secondary overlaps new button until metric refresh");
+                root.RequestedTheme(ElementTheme::Dark); root.Background(SolidColorBrush(Color{255,32,32,32}));
+                for(int i=0;i<4;++i) settle();
+                if (copy->palette[0].Color().R!=120) throw std::runtime_error("secondary theme event not applied");
+
+                auto stale=std::make_shared<WidgetPresentation>(*test.model);
+                stale->metrics.capturedAt=SampleTime::clock::now()-std::chrono::minutes(1);
+                copy->model=stale; UpdateSecondaryWidget(*copy,true);
+                if(copy->view.texts[1].Text()!=L"--%" || copy->view.graphs[0].Visibility()!=Visibility::Collapsed)
+                    throw std::runtime_error("secondary retains stale metrics");
+                RemoveWidgetCopy(test.window);
+                if (FindWidgetCopy(test.window) || root.Children().Size()!=1)
+                    throw std::runtime_error("secondary detach leaked host or subclass");
+                copy=AttachSecondaryWidget(test.window,root); copy->settings=test.settings; copy->model=test.model;
+                UpdateSecondaryWidget(*copy,true);
+                RemoveWidgetCopyFromRoot(root);
+                if (FindWidgetCopy(test.window) || root.Children().Size()!=1)
+                    throw std::runtime_error("Promoting a taskbar retained its secondary widget");
+                copy=AttachSecondaryWidget(test.window,root);
+                auto disabled=std::make_shared<ModSettings>(*test.settings); disabled->allMonitors=false;
+                SyncCopyContext disable{test.window,disabled,test.model}; SyncCopyOnOwner(&disable);
+                if (!disable.succeeded || FindWidgetCopy(test.window))
+                    throw std::runtime_error("Disabling copies retained native registration");
+                // Recreate after teardown, then let mod-thread cleanup marshal back.
+                copy=AttachSecondaryWidget(test.window,root); copy->settings=test.settings; copy->model=test.model;
+                UpdateSecondaryWidget(*copy,true); settle();
+            } catch(const std::exception& e) { test.error=e.what(); }
+              catch(const winrt::hresult_error& e) { test.error=stage + " secondary test HRESULT " + std::to_string(static_cast<unsigned>(e.code())); }
+        };
+        if(!RunFromWindowThread(context.window,check,&context)) context.error="secondary owner dispatch failed";
+        if(!RemoveAllWidgetCopies() || !CopyWindows().empty()) context.error="cross-thread secondary cleanup failed";
+        PostThreadMessageW(GetWindowThreadProcessId(context.window,nullptr),WM_APP+73,0,0);
+    }
+    owner.join();
+    if(!context.error.empty()) throw std::runtime_error(context.error);
+
+    // RenderTargetBitmap export is not supported by the secondary-thread
+    // fixture on all Windows builds. Render the same instance on this thread.
+    HWND shotWindow=CreateWindowExW(0,L"STATIC",L"",WS_POPUP,0,0,1000,48,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+    auto shotIsland=Windows::UI::Xaml::Hosting::DesktopWindowXamlSource();
+    auto shotNative=shotIsland.as<IDesktopWindowXamlSourceNative>();
+    check_hresult(shotNative->AttachToWindow(shotWindow));
+    HWND shotChild=nullptr; check_hresult(shotNative->get_WindowHandle(&shotChild));
+    SetWindowPos(shotChild,nullptr,0,0,1000,48,SWP_NOZORDER|SWP_NOACTIVATE|SWP_SHOWWINDOW);
+    Grid shotRoot; shotRoot.Width(1000); shotRoot.Height(48); shotIsland.Content(shotRoot);
+    auto* shot=AttachSecondaryWidget(shotWindow,shotRoot); shot->settings=settings; shot->model=model;
+    for(bool light : {true,false}) {
+        shotRoot.RequestedTheme(light ? ElementTheme::Light : ElementTheme::Dark);
+        shotRoot.Background(SolidColorBrush(light ? Color{255,242,242,242} : Color{255,32,32,32}));
+        shotRoot.Measure(Size{1000,48}); shotRoot.Arrange(Rect{0,0,1000,48}); shotRoot.UpdateLayout(); Pump();
+        UpdateSecondaryWidget(*shot,true); shotRoot.UpdateLayout(); Pump();
+        SaveImage(shotRoot,folder,light ? L"secondary-light.png" : L"secondary-dark.png");
+    }
+    DestroyWindow(shotWindow);
+    if (!CopyWindows().empty()) throw std::runtime_error("Destroyed secondary window retained registry entry");
+    shotIsland.Content(nullptr); shotIsland.Close();
+    std::wcout << L"PASS: secondary XAML on another UI thread, local themes, event placement, stale data and teardown\n";
+}
+
 int wmain(int argc, wchar_t** argv) {
     if (argc != 2) return 2;
     init_apartment(apartment_type::single_threaded);
@@ -418,6 +546,16 @@ int wmain(int argc, wchar_t** argv) {
             island.Content(frame); g_settings = initialSettings;
             SetWindowPos(child, nullptr, 0, 0, 520, 64, SWP_NOZORDER | SWP_NOACTIVATE);
             if (!InjectWidget(frame)) throw std::runtime_error("Post-dock injection failed");
+        }
+        {
+            auto multiple = std::make_shared<ModSettings>(*initialSettings);
+            multiple->allMonitors = true; g_settings = multiple;
+            ApplyWidgetSettings(); PublishDocumentationSamples();
+            std::shared_ptr<const WidgetPresentation> model;
+            { std::lock_guard lock(g_presentationMutex); model = g_presentation; }
+            if (!model) throw std::runtime_error("Primary did not publish shared presentation");
+            SecondaryUiChecks(argv[1], multiple, model);
+            g_settings = initialSettings; ApplyWidgetSettings();
         }
         // Exercise real XAML cells with the optional column in both units,
         // every layout, and after disabling it again.
