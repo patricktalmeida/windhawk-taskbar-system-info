@@ -378,6 +378,7 @@ distinctive part of its HWiNFO name. Otherwise, leave the filters empty.
 | **Widget width** | Preferred full-layout width, including side padding. Range: 330-800 logical pixels; default: 410. Adaptive layouts use their measured size within the available space. |
 | **Left offset** | Preferred horizontal position before dragging. Nonnegative logical pixels; default: 10. |
 | **Taskbar monitor** | Initial display, range 1-32. Monitor 1 is primary; the rest follow their position in the virtual desktop and may differ from Windows numbering. |
+| **Show on all monitors** | Off by default. Adds a read-only copy of the widget to every other monitor's taskbar. Copies use that monitor's saved position or Left offset and never reserve space before Start. |
 | **Move widget hotkey** | Disabled by default. Set an unused combination to enable moving. |
 | **Reserve space before the Start button** | Allows the button group to shift when a safe reservation fits. Off by default. |
 | **Reserved space gap** | Gap after a reservation. Range: 0-100 logical pixels; default: 8; effective minimum: 6. |
@@ -488,6 +489,12 @@ Released under [GPL-3.0](https://github.com/starychenko/windhawk-taskbar-system-
   $name:uk-UA: Монітор панелі завдань
   $description: "Initial target, range 1-32; 1 is primary. Others follow virtual desktop order, which can differ from Windows numbering. Dragging overrides this target; changing this setting restores manual selection. Missing displays temporarily use the primary taskbar."
   $description:uk-UA: "Початковий монітор, діапазон 1-32; 1 - основний. Інші йдуть за розташуванням у віртуальному робочому столі, номери можуть відрізнятися від Windows. Перетягування змінює ціль; зміна налаштування повертає ручний вибір. Недоступний дисплей тимчасово замінює основна панель."
+
+- allMonitors: false
+  $name: Show on all monitors
+  $name:uk-UA: Показувати на всіх моніторах
+  $description: "Also shows a copy of the widget on every other monitor's taskbar. Taskbar monitor and dragging still select the main widget; copies use each monitor's saved position or Left offset and never reserve space before Start."
+  $description:uk-UA: "Додатково показує копію віджета на панелі завдань кожного іншого монітора. Монітор панелі завдань і перетягування й далі визначають основний віджет; копії використовують збережену позицію свого монітора або Відступ зліва і не резервують місце перед кнопкою Пуск."
 
 - moveHotkey: ""
   $name: Move widget hotkey
@@ -754,6 +761,7 @@ using XamlRectangle = winrt::Windows::UI::Xaml::Shapes::Rectangle;
 namespace {
 
 constexpr wchar_t kWidgetName[] = L"WindhawkTaskbarSystemInfo";
+constexpr wchar_t kMirrorName[] = L"WindhawkTaskbarSystemInfoMirror";
 constexpr double kWidgetHeight = 38.0;
 constexpr double kRowHeight = 18.0;
 constexpr double kRowGap = 2.0;
@@ -829,6 +837,7 @@ struct ModSettings {
     bool adaptiveColors = true;
     bool reserveSpace = false;
     bool showNetwork = false;
+    bool allMonitors = false;
     bool networkBits = false;
     int reserveGap = 8;
     int updateInterval = 1;
@@ -1105,6 +1114,7 @@ void LoadSettings() {
     settings.reserveSpace = Wh_GetIntSetting(L"reserveSpace") != 0;
     settings.reserveGap = std::clamp(Wh_GetIntSetting(L"reserveGap"), 0, 100);
     settings.showNetwork = Wh_GetIntSetting(L"showNetwork") != 0;
+    settings.allMonitors = Wh_GetIntSetting(L"allMonitors") != 0;
     settings.networkBits = GetStringSetting(L"networkUnit") == L"bits";
     settings.updateInterval =
         std::clamp(Wh_GetIntSetting(L"updateInterval"), 1, 10);
@@ -5180,7 +5190,8 @@ void CollectTaskbarObstacles(FrameworkElement element,
         cache.complete = false;
         return;
     }
-    if (!element || element.Name() == kWidgetName) {
+    if (!element || element.Name() == kWidgetName ||
+        element.Name() == kMirrorName) {
         return;
     }
     movable = movable || (repeater && element == repeater);
@@ -5791,6 +5802,8 @@ void ResetPlacementRetryState();
 HWND FindPrimaryTaskbarWindow();
 bool IsCurrentProcessTaskbarWindow(HWND window, bool* secondary);
 
+void SyncMirrors();
+
 void RefreshTaskbarUi(bool refreshSystemState = true) {
     if (g_unloading || g_refreshInProgress) {
         return;
@@ -5811,6 +5824,7 @@ void RefreshTaskbarUi(bool refreshSystemState = true) {
         Wh_Log(L"Taskbar update failed: %08X",
                static_cast<unsigned>(winrt::to_hresult()));
     }
+    SyncMirrors();
     g_refreshInProgress = false;
 }
 
@@ -6244,6 +6258,11 @@ bool InjectWidget(FrameworkElement taskbarFrame) {
     auto children = root.Children();
     for (uint32_t index = 0; index < children.Size();) {
         auto element = children.GetAt(index).try_as<FrameworkElement>();
+        if (element && element.Name() == kMirrorName) {
+            // The main widget replaces this taskbar's copy.
+            children.RemoveAt(index);
+            continue;
+        }
         if (!element || element.Name() != kWidgetName) {
             index++;
             continue;
@@ -6879,6 +6898,349 @@ FrameworkElement FindTaskbarFrame(HWND taskbarWindow) {
     });
 }
 
+// Read-only copies of the main widget for the other monitors' taskbars. They
+// are created, updated and removed only on the taskbar UI thread, and take
+// their text, colors and history from the main widget's own elements.
+struct MirrorWidget {
+    HWND window = nullptr;
+    Grid root{nullptr};
+    FrameworkElement repeater{nullptr};
+    Viewbox host{nullptr};
+    Canvas canvas{nullptr};
+    std::vector<Border> cells;     // Same order as WidgetLayout cells, netCells.
+    std::vector<TextBlock> texts;
+    std::vector<XamlRectangle> bars;  // RAM track/fill, VRAM track/fill.
+    std::vector<XamlPath> graphs;
+    std::optional<WidgetLayout> layout;
+    std::shared_ptr<const ModSettings> styled;
+    TaskbarGeometryCache cache;
+    double previousLeft = 0;
+};
+[[clang::no_destroy]] std::vector<MirrorWidget> g_mirrors;
+SampleTime g_nextMirrorCreation{};
+
+void DetachMirror(MirrorWidget& mirror) {
+    try {
+        uint32_t index = 0;
+        if (mirror.root && mirror.host &&
+            mirror.root.Children().IndexOf(mirror.host, index)) {
+            mirror.root.Children().RemoveAt(index);
+        }
+    } catch (...) {
+        Wh_Log(L"Removing a widget copy failed: %08X",
+               static_cast<unsigned>(winrt::to_hresult()));
+    }
+}
+
+void RemoveMirrors() {
+    for (auto& mirror : g_mirrors) {
+        DetachMirror(mirror);
+    }
+    g_mirrors.clear();
+}
+
+bool CreateMirror(HWND window) {
+    auto frame = FindTaskbarFrame(window);
+    if (!frame) {
+        return false;
+    }
+    auto root = FindDirectChildByName(frame, L"RootGrid").try_as<Grid>();
+    if (!root || root == g_rootGrid) {
+        return false;
+    }
+    auto children = root.Children();
+    for (uint32_t index = children.Size(); index-- > 0;) {
+        auto element = children.GetAt(index).try_as<FrameworkElement>();
+        if (element && element.Name() == kMirrorName) {
+            children.RemoveAt(index);
+        }
+    }
+
+    MirrorWidget mirror;
+    mirror.window = window;
+    mirror.root = root;
+    mirror.repeater = FindDirectChildByName(root, L"TaskbarFrameRepeater");
+    Canvas canvas;
+    canvas.IsHitTestVisible(false);
+    for (int index = 0; index < 4; ++index) {
+        XamlRectangle bar;
+        bar.Height(1.25);
+        bar.RadiusX(0.625);
+        bar.RadiusY(0.625);
+        bar.IsHitTestVisible(false);
+        canvas.Children().Append(bar);
+        mirror.bars.push_back(bar);
+    }
+    for (int index = 0; index < 2; ++index) {
+        XamlPath graph;
+        graph.Stretch(Stretch::None);
+        graph.StrokeThickness(1.25);
+        graph.StrokeStartLineCap(PenLineCap::Round);
+        graph.StrokeEndLineCap(PenLineCap::Round);
+        graph.StrokeLineJoin(PenLineJoin::Round);
+        graph.IsHitTestVisible(false);
+        canvas.Children().Append(graph);
+        mirror.graphs.push_back(graph);
+    }
+    for (int index = 0; index < 16; ++index) {
+        TextBlock text = CreateCellText(L"", TextAlignment::Left);
+        Border cell;
+        cell.IsHitTestVisible(false);
+        cell.Child(text);
+        canvas.Children().Append(cell);
+        mirror.cells.push_back(cell);
+        mirror.texts.push_back(text);
+    }
+    Viewbox host;
+    host.Name(kMirrorName);
+    host.IsHitTestVisible(false);
+    host.Stretch(Stretch::Uniform);
+    host.StretchDirection(StretchDirection::DownOnly);
+    host.HorizontalAlignment(HorizontalAlignment::Left);
+    host.VerticalAlignment(VerticalAlignment::Center);
+    host.Visibility(Visibility::Collapsed);
+    host.Child(canvas);
+    Canvas::SetZIndex(host, 10000);
+    Grid::SetColumn(host, 0);
+    Grid::SetColumnSpan(
+        host, std::max(1, static_cast<int>(root.ColumnDefinitions().Size())));
+    children.Append(host);
+    mirror.canvas = canvas;
+    mirror.host = host;
+    g_mirrors.push_back(std::move(mirror));
+    return true;
+}
+
+void UpdateMirror(MirrorWidget& mirror,
+                  const std::shared_ptr<const ModSettings>& settingsSnapshot) {
+    const ModSettings& settings = *settingsSnapshot;
+    auto geometry = MeasureTaskbarGeometry(mirror.root, mirror.repeater, 0,
+                                           &mirror.cache);
+    PreferredPosition preferred{static_cast<double>(settings.leftOffset),
+                                mirror.previousLeft,
+                                SavedTaskbarFraction(mirror.window)};
+    // Copies only use free gaps; the Start-button reservation stays with the
+    // main widget.
+    auto resolved = ResolveWidgetPlacement(settings, geometry, preferred,
+                                           MeasureWidgetFont(settings), false);
+    const WidgetLayout& layout = resolved.layout;
+    const auto& placement = resolved.placement;
+    auto visibility =
+        placement.width > 0 ? Visibility::Visible : Visibility::Collapsed;
+    if (mirror.host.Visibility() != visibility) {
+        mirror.host.Visibility(visibility);
+    }
+    if (placement.width <= 0) {
+        return;
+    }
+    bool relayout =
+        !mirror.layout || !SameWidgetLayout(*mirror.layout, layout);
+    bool restyle = relayout || mirror.styled != settingsSnapshot;
+    if (relayout) {
+        mirror.canvas.Width(layout.width);
+        mirror.canvas.Height(layout.height);
+    }
+    if (!std::isfinite(mirror.host.Width()) ||
+        std::abs(mirror.host.Width() - placement.width) > 0.01) {
+        mirror.host.Width(placement.width);
+    }
+    double height = std::isfinite(geometry.height) && geometry.height > 0
+                        ? std::min(layout.height, geometry.height)
+                        : layout.height;
+    if (!std::isfinite(mirror.host.Height()) ||
+        std::abs(mirror.host.Height() - height) > 0.01) {
+        mirror.host.Height(height);
+    }
+    if (std::abs(mirror.host.Margin().Left - placement.left) > 0.01) {
+        mirror.host.Margin(Thickness{placement.left, 0, 0, 0});
+    }
+    mirror.previousLeft = placement.left;
+
+    const TextBlock textSources[] = {
+        g_cpuLabel,     g_cpuUsageText,    g_cpuTempText,  g_ramLabel,
+        g_ramPercentText, g_ramCapacityText, g_gpuLabel,   g_gpuUsageText,
+        g_gpuTempText,  g_vramLabel,       g_vramPercentText,
+        g_vramCapacityText, g_netDownLabel, g_netDownText, g_netUpLabel,
+        g_netUpText};
+    for (size_t i = 0; i < mirror.texts.size(); ++i) {
+        const TextBlock& source = textSources[i];
+        auto text = mirror.texts[i];
+        auto cell = mirror.cells[i];
+        Rect bounds = i < layout.cells.size()
+                          ? layout.cells[i]
+                          : layout.netCells[i - layout.cells.size()];
+        bool visible = source && bounds.Width > 0 && bounds.Height > 0;
+        auto cellVisibility =
+            visible ? Visibility::Visible : Visibility::Collapsed;
+        if (cell.Visibility() != cellVisibility) {
+            cell.Visibility(cellVisibility);
+        }
+        if (!visible) {
+            continue;
+        }
+        if (relayout) {
+            Canvas::SetLeft(cell, bounds.X);
+            Canvas::SetTop(cell, bounds.Y);
+            cell.Width(bounds.Width);
+            cell.Height(bounds.Height);
+        }
+        if (restyle) {
+            text.TextAlignment(source.TextAlignment());
+            text.FontFamily(source.FontFamily());
+            text.FontSize(source.FontSize());
+            text.FontWeight(source.FontWeight());
+        }
+        if (text.Text() != source.Text()) {
+            text.Text(source.Text());
+        }
+        if (text.Opacity() != source.Opacity()) {
+            text.Opacity(source.Opacity());
+        }
+        if (source.ReadLocalValue(TextBlock::ForegroundProperty()) ==
+            DependencyProperty::UnsetValue()) {
+            text.ClearValue(TextBlock::ForegroundProperty());
+        } else if (text.Foreground() != source.Foreground()) {
+            text.Foreground(source.Foreground());
+        }
+    }
+
+    const XamlRectangle barSources[] = {g_ramTrack, g_ramFill, g_vramTrack,
+                                        g_vramFill};
+    for (size_t i = 0; i < mirror.bars.size(); ++i) {
+        const XamlRectangle& source = barSources[i];
+        auto bar = mirror.bars[i];
+        Rect bounds = layout.bars[i / 2];
+        bool visible = source && layout.showMemoryDetails && bounds.Width > 0;
+        auto barVisibility =
+            visible ? Visibility::Visible : Visibility::Collapsed;
+        if (bar.Visibility() != barVisibility) {
+            bar.Visibility(barVisibility);
+        }
+        if (!visible) {
+            continue;
+        }
+        if (relayout) {
+            Canvas::SetLeft(bar, bounds.X);
+            Canvas::SetTop(bar, bounds.Y);
+        }
+        double width =
+            g_memoryBarWidth > 0
+                ? bounds.Width *
+                      std::clamp(source.Width() / g_memoryBarWidth, 0.0, 1.0)
+                : 0;
+        if (!(std::abs(bar.Width() - width) <= 0.01)) {
+            bar.Width(width);
+        }
+        if (bar.Fill() != source.Fill()) {
+            bar.Fill(source.Fill());
+        }
+        if (bar.Opacity() != source.Opacity()) {
+            bar.Opacity(source.Opacity());
+        }
+    }
+
+    const XamlPath graphSources[] = {g_cpuGraph, g_gpuGraph};
+    const std::deque<HistorySample>* histories[] = {&g_cpuHistory,
+                                                    &g_gpuHistory};
+    // UpdateSparkline sizes its runs from the main widget's graph state.
+    struct GraphStateGuard {
+        double width = g_graphWidth;
+        bool visible = g_layoutGraphsVisible;
+        ~GraphStateGuard() {
+            g_graphWidth = width;
+            g_layoutGraphsVisible = visible;
+        }
+    } graphStateGuard;
+    auto now = SampleTime::clock::now();
+    for (size_t i = 0; i < mirror.graphs.size(); ++i) {
+        const XamlPath& source = graphSources[i];
+        auto graph = mirror.graphs[i];
+        Rect bounds = layout.graphs[i];
+        if (relayout) {
+            Canvas::SetLeft(graph, bounds.X);
+            Canvas::SetTop(graph, bounds.Y);
+            graph.Width(layout.showGraphs ? bounds.Width : 0);
+            graph.Height(kGraphHeight);
+        }
+        if (source) {
+            if (graph.Stroke() != source.Stroke()) {
+                graph.Stroke(source.Stroke());
+            }
+            if (graph.Opacity() != source.Opacity()) {
+                graph.Opacity(source.Opacity());
+            }
+        }
+        g_graphWidth = layout.showGraphs ? bounds.Width : 0;
+        g_layoutGraphsVisible = layout.showGraphs;
+        UpdateSparkline(graph, *histories[i], settings, now);
+    }
+    mirror.layout = layout;
+    mirror.styled = settingsSnapshot;
+}
+
+void SyncMirrors() {
+    try {
+        auto settings = CurrentSettings();
+        HWND mainWindow = g_taskbarWindow.load();
+        if (g_unloading || !settings->allMonitors || !g_widget ||
+            !g_rootGrid || g_placementLocationUnknown ||
+            !IsCurrentProcessTaskbarWindow(mainWindow)) {
+            RemoveMirrors();
+            return;
+        }
+        // Only taskbars owned by this UI thread can host a copy.
+        std::vector<HWND> windows;
+        EnumThreadWindows(
+            GetCurrentThreadId(),
+            [](HWND window, LPARAM context) -> BOOL {
+                try {
+                    if (IsCurrentProcessTaskbarWindow(window)) {
+                        reinterpret_cast<std::vector<HWND>*>(context)
+                            ->push_back(window);
+                    }
+                    return TRUE;
+                } catch (...) {
+                    return FALSE;
+                }
+            },
+            reinterpret_cast<LPARAM>(&windows));
+        std::erase_if(g_mirrors, [&](MirrorWidget& mirror) {
+            uint32_t index = 0;
+            bool keep = mirror.window != mainWindow &&
+                        std::find(windows.begin(), windows.end(),
+                                  mirror.window) != windows.end() &&
+                        mirror.root != g_rootGrid && mirror.root.IsLoaded() &&
+                        mirror.root.Children().IndexOf(mirror.host, index);
+            if (!keep) {
+                DetachMirror(mirror);
+            }
+            return !keep;
+        });
+        auto now = SampleTime::clock::now();
+        for (HWND window : windows) {
+            if (window == mainWindow || now < g_nextMirrorCreation ||
+                std::any_of(g_mirrors.begin(), g_mirrors.end(),
+                            [&](const MirrorWidget& mirror) {
+                                return mirror.window == window;
+                            })) {
+                continue;
+            }
+            if (!CreateMirror(window)) {
+                g_nextMirrorCreation = now + std::chrono::seconds(5);
+            }
+        }
+        for (auto& mirror : g_mirrors) {
+            UpdateMirror(mirror, settings);
+        }
+    } catch (...) {
+        Wh_Log(L"Updating widget copies failed: %08X",
+               static_cast<unsigned>(winrt::to_hresult()));
+        RemoveMirrors();
+        g_nextMirrorCreation =
+            SampleTime::clock::now() + std::chrono::seconds(5);
+    }
+}
+
 struct ApplyWidgetContext {
     HWND taskbarWindow = nullptr;
     FrameworkElement taskbarFrame{nullptr};
@@ -6968,6 +7330,7 @@ struct RemoveTaskbarUiContext {
 void RemoveFromCurrentTaskbar(void* contextValue) {
     auto* context = reinterpret_cast<RemoveTaskbarUiContext*>(contextValue);
     bool succeeded = true;
+    RemoveMirrors();
     try {
         succeeded = RemoveWidget() && succeeded;
     } catch (...) {

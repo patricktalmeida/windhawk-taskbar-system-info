@@ -165,7 +165,7 @@ def main() -> int:
     assert metadata.get("description:uk-UA")
 
     settings = parse_settings(extract_block(source, "WindhawkModSettings"))
-    assert len(settings) == 31, f"Expected 31 settings, got {len(settings)}"
+    assert len(settings) == 32, f"Expected 32 settings, got {len(settings)}"
     assert next(item for item in settings if "moveHotkey" in item)["moveHotkey"] == ""
 
     setting_keys: set[str] = set()
@@ -189,6 +189,9 @@ def main() -> int:
 
     adaptive_colors = next(item for item in settings if "adaptiveColors" in item)
     assert adaptive_colors["adaptiveColors"] is True
+
+    all_monitors = next(item for item in settings if "allMonitors" in item)
+    assert all_monitors["allMonitors"] is False
 
     show_network = next(item for item in settings if "showNetwork" in item)
     assert show_network["showNetwork"] is False
