@@ -439,7 +439,7 @@ int wmain(int argc, wchar_t** argv) {
                     g_widget.UpdateLayout();
                     for (auto text : {g_netDownText, g_netUpText}) {
                         if (text.Text() == L"--" || text.ActualWidth() <= 0 ||
-                            text.DesiredSize().Width > text.ActualWidth() + .1)
+                            text.DesiredSize().Width > Controls::Primitives::LayoutInformation::GetLayoutSlot(text).Width + 1)
                             throw std::runtime_error("Network value is missing or clipped");
                     }
                     WidgetPreviewFrame preview; CaptureWidgetPreview(&preview);
