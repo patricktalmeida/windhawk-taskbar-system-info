@@ -425,6 +425,8 @@ int wmain(int argc, wchar_t** argv) {
             auto network = std::make_shared<ModSettings>(*initialSettings);
             network->showNetwork = true; g_settings = network;
             frame.Width(1800); root.Width(1800); frame.Height(48); root.Height(48);
+            frame.Measure(Size{1800,48}); frame.Arrange(Rect{0,0,1800,48});
+            frame.UpdateLayout(); Pump();
             for (bool bits : {false, true}) {
                 network->networkBits = bits; ApplyWidgetSettings();
                 MetricsSnapshot sample; sample.capturedAt = SampleTime::clock::now();
@@ -434,15 +436,19 @@ int wmain(int argc, wchar_t** argv) {
                                   WidgetLayoutMode::CompactTwoRows, WidgetLayoutMode::CompactOneRow}) {
                     auto layout = BuildWidgetLayout(*network, MeasureWidgetFont(*network), mode, 48);
                     ApplyWidgetGeometry(*network, layout);
+                    g_widgetHost.Width(layout.width); g_widgetHost.Height(layout.height);
+                    g_widgetHost.Visibility(Visibility::Visible);
                     g_widget.Measure(Size{static_cast<float>(layout.width), static_cast<float>(layout.height)});
                     g_widget.Arrange(Rect{0, 0, static_cast<float>(layout.width), static_cast<float>(layout.height)});
                     g_widget.UpdateLayout();
                     for (auto text : {g_netDownText, g_netUpText}) {
                         if (text.Text() == L"--" || text.ActualWidth() <= 0 ||
                             text.DesiredSize().Width > Controls::Primitives::LayoutInformation::GetLayoutSlot(text).Width + 1)
-                            throw std::runtime_error("Network value is missing or clipped");
+                        { std::wcout << L"NETWORK fail mode=" << int(mode) << L" text=" << text.Text().c_str() << L" actual=" << text.ActualWidth() << L" desired=" << text.DesiredSize().Width << L" slot=" << Controls::Primitives::LayoutInformation::GetLayoutSlot(text).Width << L"\n";
+                            throw std::runtime_error("Network value is missing or clipped"); }
                     }
-                    WidgetPreviewFrame preview; CaptureWidgetPreview(&preview);
+                    CaptureWidgetPreviewContext capture; CaptureWidgetPreview(&capture);
+                    auto& preview = capture.frame;
                     ArrangeWidgetPreview(preview, layout, *network);
                     if (preview.texts.size() != 16 || preview.texts[13].bounds.Width <= 0)
                         throw std::runtime_error("Network preview lost rate cells");
