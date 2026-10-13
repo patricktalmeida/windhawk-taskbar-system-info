@@ -13,6 +13,7 @@ BOOL Set(PCWSTR key, PCWSTR value) { values[key] = value; return TRUE; }
 namespace uiStorage {
 BOOL KeepHidden(HWND, int) { return FALSE; }
 }
+#define WH_TASKBAR_COORDINATOR_TEST
 #include "../taskbar-system-info.wh.cpp"
 #undef Wh_SetStringValue
 #undef ShowWindow
@@ -179,6 +180,40 @@ void SecondaryUiChecks(const std::wstring& folder,
                     throw std::runtime_error("secondary light theme inherited primary dark colors");
                 if (copy->view.texts[1].Text()!=FormatPercent(test.model->metrics.cpu))
                     throw std::runtime_error("secondary values differ from shared snapshot");
+                for (bool bits : {false, true, false}) {
+                    auto units = std::make_shared<ModSettings>(*test.settings);
+                    units->networkBits = bits;
+                    copy->settings = units; copy->styled = false;
+                    UpdateSecondaryWidget(*copy, true); settle();
+                    if (copy->view.texts[13].Text() != (bits ? L"1.0 Gbps" : L"119 MB/s") ||
+                        copy->view.texts[15].Text() != (bits ? L"12 Kbps" : L"1.5 KB/s") ||
+                        copy->view.netRows[0].Visibility() != Visibility::Visible ||
+                        copy->view.netRows[1].Visibility() != Visibility::Visible)
+                        throw std::runtime_error("secondary network values or unit switching lost");
+                }
+                // Exercise the shared high-contrast styling contract without
+                // changing the user's Windows accessibility settings.
+                std::array<SolidColorBrush, 3> contrastPalette{
+                    SolidColorBrush(Color{255,255,255,255}),
+                    SolidColorBrush(Color{255,255,255,0}),
+                    SolidColorBrush(Color{255,0,255,255})};
+                StyleWidgetElements(copy->view, *test.settings, contrastPalette, nullptr, true);
+                RenderWidgetValues(copy->view, test.model->metrics, *test.settings,
+                    {AlertLevel::Warning, AlertLevel::Critical, AlertLevel::Warning, AlertLevel::Critical},
+                    contrastPalette, nullptr);
+                for (auto text : copy->view.texts)
+                    if (text.Opacity() != 1) throw std::runtime_error("high contrast text is translucent");
+                if (copy->view.graphs[0].Opacity() != 1 ||
+                    std::abs(copy->view.bars[0].Opacity() - .45) > .0001 || copy->view.bars[1].Opacity() != 1)
+                    throw std::runtime_error("high contrast graph or bar opacity lost");
+                if (copy->view.graphs[0].Stroke() != contrastPalette[0] ||
+                    copy->view.texts[2].Foreground() != contrastPalette[1] ||
+                    copy->view.texts[8].Foreground() != contrastPalette[2] ||
+                    copy->view.bars[1].Fill() != contrastPalette[1] ||
+                    copy->view.bars[3].Fill() != contrastPalette[2])
+                    throw std::runtime_error("high contrast palette or alert rendering lost");
+                copy->settings = test.settings; copy->styled = false;
+                UpdateSecondaryWidget(*copy, true); settle();
                 // Bitmap export is tested on the primary XAML thread below.
                 stage="obstacle";
                 Button obstacle; obstacle.Width(650); obstacle.Height(48);
@@ -245,6 +280,8 @@ void SecondaryUiChecks(const std::wstring& folder,
     shotIsland.Content(nullptr); shotIsland.Close();
     std::wcout << L"PASS: secondary XAML on another UI thread, local themes, event placement, stale data and teardown\n";
 }
+
+#include "coordinator-smoke.inc.cpp"
 
 int wmain(int argc, wchar_t** argv) {
     if (argc != 2) return 2;
@@ -549,12 +586,18 @@ int wmain(int argc, wchar_t** argv) {
         }
         {
             auto multiple = std::make_shared<ModSettings>(*initialSettings);
-            multiple->allMonitors = true; g_settings = multiple;
+            multiple->allMonitors = true; multiple->showNetwork = true; g_settings = multiple;
             ApplyWidgetSettings(); PublishDocumentationSamples();
             std::shared_ptr<const WidgetPresentation> model;
             { std::lock_guard lock(g_presentationMutex); model = g_presentation; }
             if (!model) throw std::runtime_error("Primary did not publish shared presentation");
+            auto networkModel = std::make_shared<WidgetPresentation>(*model);
+            networkModel->metrics.netAvailable = true;
+            networkModel->metrics.netDownBytes = 125000000;
+            networkModel->metrics.netUpBytes = 1536;
+            model = networkModel;
             SecondaryUiChecks(argv[1], multiple, model);
+            CoordinatorUiChecks(multiple, model);
             g_settings = initialSettings; ApplyWidgetSettings();
         }
         // Exercise real XAML cells with the optional column in both units,
@@ -570,6 +613,9 @@ int wmain(int argc, wchar_t** argv) {
                 MetricsSnapshot sample; sample.capturedAt = SampleTime::clock::now();
                 sample.netAvailable = true; sample.netDownBytes = 125000000;
                 sample.netUpBytes = 1536; PublishMetrics(sample); UpdateWidgetText(true);
+                if (g_netDownText.Text() != (bits ? L"1.0 Gbps" : L"119 MB/s") ||
+                    g_netUpText.Text() != (bits ? L"12 Kbps" : L"1.5 KB/s"))
+                    throw std::runtime_error("Primary network values or unit switching lost");
                 for (auto mode : {WidgetLayoutMode::Full, WidgetLayoutMode::NoGraphs,
                                   WidgetLayoutMode::CompactTwoRows, WidgetLayoutMode::CompactOneRow}) {
                     auto layout = BuildWidgetLayout(*network, MeasureWidgetFont(*network), mode, 48);
@@ -588,7 +634,10 @@ int wmain(int argc, wchar_t** argv) {
                     CaptureWidgetPreviewContext capture; CaptureWidgetPreview(&capture);
                     auto& preview = capture.frame;
                     ArrangeWidgetPreview(preview, layout, *network);
-                    if (preview.texts.size() != 16 || preview.texts[13].bounds.Width <= 0)
+                    if (preview.texts.size() != 16 || preview.texts[13].bounds.Width <= 0 ||
+                        preview.texts[15].bounds.Width <= 0 ||
+                        preview.texts[13].text != (bits ? L"1.0 Gbps" : L"119 MB/s") ||
+                        preview.texts[15].text != (bits ? L"12 Kbps" : L"1.5 KB/s"))
                         throw std::runtime_error("Network preview lost rate cells");
                 }
             }

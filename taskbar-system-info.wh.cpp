@@ -6961,7 +6961,13 @@ XamlRoot GetTaskbarXamlRoot(HWND taskbarWindow) {
     return taskbarElement ? taskbarElement.XamlRoot() : nullptr;
 }
 
+#ifdef WH_TASKBAR_COORDINATOR_TEST
+FrameworkElement (*g_testFindTaskbarFrame)(HWND) = nullptr;
+#endif
 FrameworkElement FindTaskbarFrame(HWND taskbarWindow) {
+#ifdef WH_TASKBAR_COORDINATOR_TEST
+    if (g_testFindTaskbarFrame) return g_testFindTaskbarFrame(taskbarWindow);
+#endif
     XamlRoot xamlRoot = GetTaskbarXamlRoot(taskbarWindow);
     if (!xamlRoot) {
         return nullptr;
@@ -7138,6 +7144,9 @@ std::unique_ptr<SecondaryWidget> CreateSecondaryWidget(HWND window, Grid root) {
     return copy;
 }
 SecondaryWidget* AttachSecondaryWidget(HWND window, Grid root) {
+    // Inspect only this owner thread's tree. A fallback primary can already
+    // occupy this root before its native taskbar window has been identified.
+    if (FindDirectChildByName(root, kWidgetName)) return nullptr;
     auto created = CreateSecondaryWidget(window, root);
     if (!SetPropW(window, kCopyProperty, created.get())) {
         DetachSecondaryWidget(*created); return nullptr;
@@ -7201,6 +7210,10 @@ bool RemoveAllWidgetCopies() {
 void SyncWidgetCopies() {
     auto settings = CurrentSettings();
     if (!settings->allMonitors || g_unloading) { RemoveAllWidgetCopies(); return; }
+    // Loaded-frame fallback attaches the primary before its HWND is known.
+    // Reconcile only after placement resolves it, including during retry backoff.
+    HWND primary = g_taskbarWindow.load();
+    if (!primary) { RemoveAllWidgetCopies(); return; }
     std::shared_ptr<const WidgetPresentation> model;
     { std::lock_guard lock(g_presentationMutex); model = g_presentation; }
     if (!model) return;
@@ -7211,7 +7224,6 @@ void SyncWidgetCopies() {
             return TRUE;
         } catch (...) { return FALSE; }
     }, reinterpret_cast<LPARAM>(&windows));
-    HWND primary = g_taskbarWindow.load();
     for (HWND window : CopyWindows()) {
         if (window == primary || std::find(windows.begin(), windows.end(), window) == windows.end()) {
             SyncCopyContext context{window, {}, {}, true};
