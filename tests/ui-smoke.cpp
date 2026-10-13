@@ -178,6 +178,7 @@ int wmain(int argc, wchar_t** argv) {
         {
             if (!RemoveWidget()) throw std::runtime_error("Dock setup cleanup failed");
             Grid scene, dockFrame, dockRoot, dockButtons;
+            int reviewFailures = 0;
             scene.Width(1200); scene.Height(48);
             scene.Background(SolidColorBrush(Color{255, 20, 20, 20}));
             scene.RequestedTheme(ElementTheme::Dark);
@@ -219,6 +220,12 @@ int wmain(int argc, wchar_t** argv) {
             if (std::abs(dockRoot.ActualWidth() - dockWidth) > .1 ||
                 std::abs(dockButtons.Margin().Left - dockMargin) > .1)
                 throw std::runtime_error("Auto-sized dock does not settle");
+            scene.Width(400); settleDock();
+            if (g_widgetHost.Visibility() != Visibility::Collapsed || g_reservedMargin != 0)
+                throw std::runtime_error("Shrinking an already expanded dock retains clipped content");
+            scene.Width(1200); settleDock();
+            if (g_widgetHost.Visibility() != Visibility::Visible)
+                throw std::runtime_error("An expanded dock does not recover after shrink/grow");
             // DockLike uses padding; other presets add a border as well.
             dockRoot.Padding(Thickness{6, 2, 6, 2});
             dockRoot.BorderThickness(Thickness{1, 1, 1, 1});
@@ -269,6 +276,12 @@ int wmain(int argc, wchar_t** argv) {
             stableRevision = g_layoutRevision; settleDock();
             if (g_layoutRevision != stableRevision)
                 throw std::runtime_error("Theme-rejected dock reservation entered a feedback loop");
+            dockSettings->reserveGap = 6; settleDock();
+            if (g_widgetHost.Visibility() != Visibility::Visible) {
+                std::wcout << L"FAIL: changed placement settings do not retry a rejected dock\n";
+                ++reviewFailures;
+            }
+            dockSettings->reserveGap = 8;
             if (!RemoveWidget()) throw std::runtime_error("Rejected dock cleanup failed");
             Grid dockTray;
             dockTray.Name(L"SystemTrayFrame"); dockTray.Width(120); dockTray.Height(48);
@@ -293,6 +306,37 @@ int wmain(int argc, wchar_t** argv) {
                 throw std::runtime_error("Padded dock move projection differs from the rendered widget");
             SaveImage(scene, argv[1], L"dock-padding-and-tray.png");
             if (!RemoveWidget()) throw std::runtime_error("Padded dock cleanup failed");
+            scene.Children().RemoveAtEnd();
+            dockRoot.Padding(Thickness{}); dockRoot.BorderThickness(Thickness{});
+            scene.Height(20); dockButton.Height(20);
+            dockSettings->fontFamily = L"Verdana"; dockSettings->fontSize = 9; dockSettings->width = 330;
+            settleDock();
+            if (!InjectWidget(dockFrame)) throw std::runtime_error("Wide one-row dock injection failed");
+            settleDock();
+            if (g_widgetHost.Visibility() != Visibility::Visible || g_widgetHost.Width() <= 330) {
+                std::wcout << L"FAIL: measured one-row dock width is capped by preference\n";
+                ++reviewFailures;
+            }
+            if (!RemoveWidget()) throw std::runtime_error("Wide one-row dock cleanup failed");
+            scene.Height(48); dockButton.Height(38);
+            *dockSettings = *initialSettings; dockSettings->reserveSpace = true;
+            dockFrame.MaxWidth(700); dockFrame.Padding(Thickness{20, 0, 20, 0});
+            dockFrame.BorderThickness(Thickness{2, 0, 2, 0});
+            dockRoot.Margin(Thickness{40, 0, 40, 0});
+            dockRoot.Padding(Thickness{6, 0, 6, 0});
+            dockRoot.BorderThickness(Thickness{1, 0, 1, 0});
+            settleDock();
+            if (!InjectWidget(dockFrame)) throw std::runtime_error("MaxWidth dock injection failed");
+            settleDock();
+            std::wcout << L"MAXWIDTH available=" << AutoSizedDockAvailableWidth()
+                       << L" widget=" << g_widgetHost.Width() << L"\n";
+            if (g_widgetHost.Visibility() != Visibility::Visible ||
+                std::abs(AutoSizedDockAvailableWidth() - 562) > .1) {
+                std::wcout << L"FAIL: frame MaxWidth is not expressed in content coordinates\n";
+                ++reviewFailures;
+            }
+            if (!RemoveWidget()) throw std::runtime_error("MaxWidth dock cleanup failed");
+            if (reviewFailures) throw std::runtime_error("Dock review regressions failed");
             std::wcout << L"PASS: cold dock reservation, Grid selector, padding, rollback, resize recovery and unload\n";
             island.Content(frame); g_settings = initialSettings;
             SetWindowPos(child, nullptr, 0, 0, 520, 64, SWP_NOZORDER | SWP_NOACTIVATE);

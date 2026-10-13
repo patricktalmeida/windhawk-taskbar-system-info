@@ -1,7 +1,8 @@
 # Dock theme compatibility investigation
 
 Date: 2026-10-13. Local branch: `fix/dock-theme-compatibility`.
-Base: `b9f97f2` (1.7.1). This is an unreleased fix; metadata is unchanged.
+Base: `b9f97f2` (1.7.1). The investigation started against 1.7.1; the fix is
+included in the 1.7.2 release candidate prepared in PR #11.
 
 ## Reports and evidence
 
@@ -55,6 +56,8 @@ The UI test uses a hidden XAML Island; it does not inject into Explorer.
   a theme overriding the trial margin, and restoration on unload.
   A cold padded dock with a separate tray also passed, including agreement
   between its rendered widget position and the move editor's screen projection.
+  Final review also checked shrinking an already expanded dock and restoring it
+  after the parent grows again; the test passed without a production code change.
 - `python tests/validate-source.py`: passed, 29 settings.
 - `tests/run-regression.ps1`: 173,469 behavioral checks passed.
 - `tests/run-ui-smoke.ps1`: existing 105 XAML cases, five preview DPI scales,
@@ -82,3 +85,24 @@ Before, using production source from `b9f97f2`:
 After, using this branch:
 
 ![Corrected source: reserved space and visible widget](../assets/dock-regression-after.png)
+
+## PR review follow-up
+
+All three P2 comments on commit `2371316` were reproduced before remediation:
+
+- A 20-DIP dock with Verdana 9 and width preference 330 hid a measured one-row
+  layout that could fit in its parent. The trial now uses the available content
+  limit and measured layout widths, considering reservation-created slots only.
+- After a theme overrode the trial margin, changing the reservation gap from 8
+  to 6 did not retry. Rejection now tracks placement-affecting inputs separately
+  from geometry. If an external override already removed the margin, the code
+  does not wait for a nonexistent restoration layout event.
+- A frame with MaxWidth 700, 44 DIP of frame padding/border, 80 DIP of root
+  margins and 14 DIP of root padding/border reported 686 DIP of available width.
+  Converting each constraint to root-content coordinates yields 562 DIP and
+  selects a visible adaptive widget (205 DIP in this fixture).
+
+The new XAML regressions failed on the reviewed implementation and passed after
+the fixes. Existing UI scenarios also passed, including the generated real-font
+matrix and move-preview checks. Release qualification includes the metrics
+smoke test and fresh x64/ARM64 builds of version 1.7.2.

@@ -4,7 +4,7 @@
 // @name:uk-UA      Системний монітор панелі завдань
 // @description     CPU, GPU, RAM and VRAM on the Windows 11 taskbar, with temperatures, history graphs, adaptive layouts and live dragging.
 // @description:uk-UA CPU, GPU, RAM і VRAM на панелі завдань Windows 11: температури, графіки історії, адаптивні макети та перетягування живого віджета.
-// @version         1.7.1
+// @version         1.7.2
 // @author          Yevhenii Starychenko
 // @github          https://github.com/starychenko
 // @homepage        https://github.com/starychenko/windhawk-taskbar-system-info
@@ -440,7 +440,7 @@ placement errors and sensor mismatches. It does not print every sample.
 
 ## Compatibility
 
-The current source is **1.7.1**, built with Windhawk **1.7.3** for Windows 11.
+The current source is **1.7.2**, built with Windhawk **1.7.3** for Windows 11.
 The widget targets horizontal primary and secondary taskbars. x64 and ARM64
 builds pass; ARM64 hardware has not been checked.
 
@@ -4782,7 +4782,8 @@ TaskbarPlacement ResolvePlacementForSize(const ModSettings& settings,
                                          double desiredWidth,
                                          double minimumScale,
                                          double contentHeight,
-                                         bool allowReservation = true) {
+                                         bool allowReservation = true,
+                                         bool reservationOnly = false) {
     if (!geometry.ready || !std::isfinite(geometry.width) ||
         geometry.width <= 0) {
         return {};
@@ -4861,9 +4862,11 @@ TaskbarPlacement ResolvePlacementForSize(const ModSettings& settings,
                 bestPrevious = previous;
             }
         };
-        for (auto slot :
-             FreeWidgetIntervals(geometry.width, geometry.occupied)) {
-            consider(slot, false);
+        if (!reservationOnly) {
+            for (auto slot :
+                 FreeWidgetIntervals(geometry.width, geometry.occupied)) {
+                consider(slot, false);
+            }
         }
         if (settings.reserveSpace && allowReservation && hasButtons &&
             maximumShift > 0) {
@@ -4893,13 +4896,14 @@ WidgetPlacement ResolveWidgetPlacement(const ModSettings& settings,
                                        const TaskbarGeometry& geometry,
                                        PreferredPosition preferred,
                                        const WidgetFontMetrics& font,
-                                       bool allowReservation = true) {
+                                       bool allowReservation = true,
+                                       bool reservationOnly = false) {
     auto legacy = BuildWidgetLayout(settings, font, WidgetLayoutMode::Full,
                                     kWidgetHeight, true);
     auto evaluate = [&](WidgetLayout layout, double minimumScale) {
         auto placement = ResolvePlacementForSize(
             settings, geometry, preferred, layout.width, minimumScale,
-            layout.height, allowReservation);
+            layout.height, allowReservation, reservationOnly);
         layout.scale = placement.width > 0
                            ? std::min({1.0, placement.width / layout.width,
                                        geometry.height > 0
@@ -5046,6 +5050,12 @@ Thickness TaskbarContentInsets(FrameworkElement root) {
         return {padding.Left + border.Left, padding.Top + border.Top,
                 padding.Right + border.Right, padding.Bottom + border.Bottom};
     }
+    if (auto control = root.try_as<Control>()) {
+        auto padding = control.Padding();
+        auto border = control.BorderThickness();
+        return {padding.Left + border.Left, padding.Top + border.Top,
+                padding.Right + border.Right, padding.Bottom + border.Bottom};
+    }
     return {};
 }
 TaskbarGeometry MeasureTaskbarGeometry(
@@ -5127,6 +5137,15 @@ struct PlacementInputs {
     bool operator==(const PlacementInputs&) const = default;
 };
 std::optional<PlacementInputs> g_lastPlacementInputs;
+struct ReservationInputs {
+    int width, leftOffset, fontSize, reserveGap;
+    bool reserveSpace;
+    std::wstring fontFamily;
+    std::optional<double> savedFraction;
+    uint64_t capacityRevision;
+    bool operator==(const ReservationInputs&) const = default;
+};
+std::optional<ReservationInputs> g_lastReservationInputs;
 
 // A content-sized dock has no free gap until reserving space grows its frame.
 // Only propose a bounded trial here; the next arranged XAML pass must prove it
@@ -5146,11 +5165,18 @@ double AutoSizedDockAvailableWidth() {
         auto parentInsets = TaskbarContentInsets(parent);
         available = std::min(available, parent.ActualWidth() - parentInsets.Left - parentInsets.Right);
     }
-    double limit = std::min({available -
-                                 std::max(0.0, rootMargin.Left) - std::max(0.0, rootMargin.Right) -
-                                 std::max(0.0, frameMargin.Left) - std::max(0.0, frameMargin.Right),
-                             g_rootGrid.MaxWidth(), frame.MaxWidth()});
-    limit -= insets.Left + insets.Right;
+    auto frameInsets = TaskbarContentInsets(frame);
+    double rootInsetsWidth = insets.Left + insets.Right;
+    double frameToContent = frameInsets.Left + frameInsets.Right +
+                            std::max(0.0, rootMargin.Left) +
+                            std::max(0.0, rootMargin.Right) + rootInsetsWidth;
+    // Each maximum constrains a different box. Convert all three to root
+    // content coordinates before selecting the tightest available width.
+    double limit = std::min({
+        available - std::max(0.0, frameMargin.Left) -
+            std::max(0.0, frameMargin.Right) - frameToContent,
+        g_rootGrid.MaxWidth() - rootInsetsWidth,
+        frame.MaxWidth() - frameToContent});
     return std::isfinite(limit) ? std::max(0.0, limit) : 0;
 }
 std::optional<TaskbarPlacement> AutoSizedDockReservation(
@@ -5158,14 +5184,15 @@ std::optional<TaskbarPlacement> AutoSizedDockReservation(
     PreferredPosition preferred, double limit) {
     if (!geometry.ready) return std::nullopt;
     auto expanded = geometry;
-    expanded.width = std::min(limit, geometry.width + settings.width +
-                                        std::max<double>(kTaskbarClearance, settings.reserveGap) +
-                                        2 * kTaskbarClearance);
+    expanded.width = limit;
     if (!std::isfinite(expanded.width) || expanded.width <= geometry.width + kPlacementTolerance) {
         return std::nullopt;
     }
+    // Adaptive layouts can exceed the configured full-layout preference.
+    // Try measured layouts against the real limit, considering only slots
+    // created by reservation: a synthetic free slot alone cannot grow a dock.
     auto candidate = ResolveWidgetPlacement(settings, expanded, preferred,
-                                            MeasureWidgetFont(settings)).placement;
+                                            MeasureWidgetFont(settings), true, true).placement;
     return candidate.width > 0 && candidate.reserved > 0
                ? std::optional{candidate} : std::nullopt;
 }
@@ -5200,6 +5227,13 @@ void ApplyTaskbarPlacement(const ModSettings& settings) {
                                            ownMargin ? g_reservedMargin : 0.0,
                                            CurrentGeometryCache());
     double dockAvailableWidth = AutoSizedDockAvailableWidth();
+    auto savedFraction = SavedTaskbarFraction(g_taskbarWindow.load());
+    ReservationInputs reservationInputs{settings.width, settings.leftOffset,
+        settings.fontSize, settings.reserveGap, settings.reserveSpace,
+        settings.fontFamily, savedFraction, g_capacityBudgetRevision};
+    bool reservationInputsChanged = !g_lastReservationInputs ||
+                                    *g_lastReservationInputs != reservationInputs;
+    g_lastReservationInputs = std::move(reservationInputs);
     bool changed = geometry.occupied.size() != g_lastBaselineObstacles.size() ||
                    std::abs(geometry.width - g_lastGeometryWidth) > 0.5 ||
                    std::abs(geometry.height - g_lastGeometryHeight) > 0.5 ||
@@ -5215,7 +5249,10 @@ void ApplyTaskbarPlacement(const ModSettings& settings) {
             }
         }
     }
-    if (g_rejectionNeedsBaseline) {
+    if (reservationInputsChanged) {
+        g_reservationRejected = false;
+        g_rejectionNeedsBaseline = false;
+    } else if (g_rejectionNeedsBaseline) {
         g_rejectionNeedsBaseline = false;
     } else if (changed) {
         g_reservationRejected = false;
@@ -5229,16 +5266,22 @@ void ApplyTaskbarPlacement(const ModSettings& settings) {
         g_dockReservationTrial.reset();
         auto arranged = MeasureTaskbarGeometry(g_rootGrid, g_taskItemsRepeater,
                                                0, CurrentGeometryCache());
-        if (!settings.reserveSpace || !ownMargin || !arranged.ready ||
+        if (reservationInputsChanged || !settings.reserveSpace || !ownMargin || !arranged.ready ||
             !PlacementFits(arranged, {trial.left, trial.width, 0}) ||
             !ReservedControlsFit(arranged)) {
-            g_reservationRejected = true;
-            g_rejectionNeedsBaseline = true;
-            g_taskItemsRepeater.Margin(margin);
+            bool restoreMargin = ownMargin && g_reservedMargin != 0;
+            g_reservationRejected = !reservationInputsChanged;
+            g_rejectionNeedsBaseline = restoreMargin;
+            if (restoreMargin) {
+                g_taskItemsRepeater.Margin(margin);
+            }
             g_reservedMargin = 0;
             g_lastAppliedRepeaterMarginLeft.reset();
             g_lastPlacementInputs.reset();
-            g_reservationAwaitingLayout = true;
+            // An external override already removed our margin. Writing that
+            // same value does not schedule layout, so waiting would deadlock
+            // future settings-only retries behind an event that never arrives.
+            g_reservationAwaitingLayout = restoreMargin;
             g_reservationRevision = g_layoutRevision;
             return;
         }
@@ -5265,7 +5308,6 @@ void ApplyTaskbarPlacement(const ModSettings& settings) {
             return;
         }
     }
-    auto savedFraction = SavedTaskbarFraction(g_taskbarWindow.load());
     PlacementInputs inputs{geometry,
                            settings.width,
                            settings.leftOffset,
@@ -5888,6 +5930,7 @@ bool RemoveWidget() {
     g_rejectionNeedsBaseline = false;
     g_lastBaselineObstacles.clear();
     g_lastPlacementInputs.reset();
+    g_lastReservationInputs.reset();
     g_geometryCache.reset(); // Release cached XAML references and storage on their owning thread.
 
     if (g_rootGrid && g_widgetHost) {
