@@ -215,6 +215,45 @@ int wmain(int argc, wchar_t** argv) {
                 throw std::runtime_error("Auto-sized dock cannot reserve space from a cold injection");
             if (!g_widgetHost.try_as<Grid>())
                 throw std::runtime_error("Grid#WindhawkTaskbarSystemInfo theme selector no longer matches");
+            // A saved right-side position must not select the trailing gap
+            // created by our own reservation and repeatedly shrink the dock.
+            auto oldProfiles = PlacementProfilesSnapshot();
+            auto oldTaskbarWindow = g_taskbarWindow.load();
+            g_taskbarWindow = window;
+            auto dockKey = MonitorKey(window);
+            if (dockKey.empty()) throw std::runtime_error("Missing fixture monitor key");
+            dockButton.Width(600);
+            for (double fraction : {.6, .75, .9}) {
+                PlacementProfiles profiles;
+                profiles.positions[dockKey] = fraction;
+                SetPlacementProfiles(profiles);
+                settleDock();
+                auto revision = g_layoutRevision;
+                double reserved = g_reservedMargin;
+                settleDock();
+                if (g_layoutRevision != revision || reserved <= 0 ||
+                    std::abs(reserved - g_reservedMargin) > .1 ||
+                    g_widgetHost.Visibility() != Visibility::Visible)
+                    throw std::runtime_error("Saved right-side dock position oscillates after reservation");
+                TaskbarProjection projection;
+                projection.window = window; projection.key = dockKey;
+                ProbeTaskbarFrameGeometry(projection, dockFrame);
+                if (!projection.geometry.ready || !projection.reservationOnly)
+                    throw std::runtime_error("Grown dock projection lost its reservation constraint");
+                g_moveEditor = std::make_shared<MoveEditorState>();
+                // Exercise the real candidate search without creating a native
+                // preview window; closing suppresses only the final render.
+                g_moveEditor->closing = true;
+                g_moveEditor->visual.fontMetrics = MeasureWidgetFont(*dockSettings);
+                UpdateMoveCandidate(projection, 900);
+                if (g_moveEditor->candidate.width <= 0 ||
+                    g_moveEditor->candidate.reserved <= 0)
+                    throw std::runtime_error("Move editor offered synthetic trailing dock gap");
+                g_moveEditor.reset();
+            }
+            SetPlacementProfiles(oldProfiles);
+            g_taskbarWindow = oldTaskbarWindow;
+            dockButton.Width(300); settleDock();
             double dockWidth = dockRoot.ActualWidth(), dockMargin = dockButtons.Margin().Left;
             settleDock();
             if (std::abs(dockRoot.ActualWidth() - dockWidth) > .1 ||
@@ -240,7 +279,7 @@ int wmain(int argc, wchar_t** argv) {
                 throw std::runtime_error("Dock padding/border breaks the actual widget clearance");
             dockRoot.Padding(Thickness{}); dockRoot.BorderThickness(Thickness{});
             dockSettings->reserveSpace = false; settleDock();
-            if (dockButtons.Margin().Left != 0)
+            if (dockButtons.Margin().Left != 0 || g_dockReservationActive)
                 throw std::runtime_error("Disabling dock reservation retained its margin");
             dockSettings->reserveSpace = true; settleDock();
             if (g_widgetHost.Visibility() != Visibility::Visible)
