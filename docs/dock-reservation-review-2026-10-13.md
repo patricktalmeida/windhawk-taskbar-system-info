@@ -33,3 +33,20 @@ This follow-up changes the upstream submission after the companion 1.7.2 release
 The published v1.7.2 tag and release asset remain unchanged and do not contain
 this follow-up. Live Explorer with the reporters' exact themes and physical
 mixed-DPI monitor transfers remain unverified.
+
+## Second review: switching themes
+
+The second AI review found no blockers but noted that the confirmed-reservation
+flag survived a switch from a dock to a stretched or fixed-width taskbar if the
+theme retained the repeater margin. A new XAML regression reproduced this on
+the first follow-up: `Dock-to-normal theme switch retains reservation-only placement`.
+
+Placement now clears the flag when `AutoSizedDockAvailableWidth()` returns zero.
+A trial that finishes after the theme changes also cannot reactivate the flag.
+The regression switches a live fixture from a dock to stretched and fixed-width
+layouts without reinjection, checks the saved right-side placement and unrestricted
+move projection, and verifies stable, non-overlapping placement when switching
+back to a dock. That reverse transition also exposed a path where a visible
+widget keeps the root wide enough for the normal solver to apply a reservation
+without a cold trial. Such a reservation now also activates the dock constraint,
+preventing another reserved/unreserved oscillation.

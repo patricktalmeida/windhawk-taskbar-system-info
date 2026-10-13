@@ -251,9 +251,47 @@ int wmain(int argc, wchar_t** argv) {
                     throw std::runtime_error("Move editor offered synthetic trailing dock gap");
                 g_moveEditor.reset();
             }
+            for (bool fixedWidth : {false, true}) {
+                if (!RemoveWidget()) throw std::runtime_error("Theme-switch setup failed");
+                settleDock();
+                if (!InjectWidget(dockFrame)) throw std::runtime_error("Theme-switch dock injection failed");
+                settleDock();
+                if (!g_dockReservationActive)
+                    throw std::runtime_error("Theme-switch test requires an active dock reservation");
+                if (fixedWidth) dockFrame.Width(1200);
+                else dockFrame.HorizontalAlignment(HorizontalAlignment::Stretch);
+                settleDock();
+                auto expected = ResolveWidgetPlacement(*dockSettings,
+                    MeasureTaskbarGeometry(dockRoot, dockButtons, g_reservedMargin),
+                    {10, g_previousPlacementLeft.load(), .9}, MeasureWidgetFont(*dockSettings));
+                if (g_dockReservationActive || g_reservedMargin != 0 ||
+                    g_widgetHost.Visibility() != Visibility::Visible ||
+                    std::abs(g_widgetHost.Margin().Left - expected.placement.left) > .25)
+                    throw std::runtime_error("Dock-to-normal theme switch retains reservation-only placement");
+                TaskbarProjection projection; projection.window = window;
+                ProbeTaskbarFrameGeometry(projection, dockFrame);
+                if (projection.reservationOnly)
+                    throw std::runtime_error("Normal taskbar move projection retained dock restriction");
+                dockFrame.Width(std::numeric_limits<double>::quiet_NaN());
+                dockFrame.HorizontalAlignment(HorizontalAlignment::Center);
+                // Allow the visible widget's adaptive width to converge before
+                // asserting that subsequent passes no longer change layout.
+                for (int pass = 0; pass < 4; ++pass) settleDock();
+                auto revision = g_layoutRevision;
+                settleDock();
+                if (g_layoutRevision != revision ||
+                    g_widgetHost.Visibility() != Visibility::Visible ||
+                    !PlacementFits(MeasureTaskbarGeometry(dockRoot, dockButtons),
+                        {g_widgetHost.Margin().Left, g_widgetHost.Width(), 0}))
+                    throw std::runtime_error("Switching back to dock did not settle at a valid position");
+            }
+            // Return to a cold dock for the remaining reservation regressions.
+            if (!RemoveWidget()) throw std::runtime_error("Theme-switch cleanup failed");
             SetPlacementProfiles(oldProfiles);
             g_taskbarWindow = oldTaskbarWindow;
             dockButton.Width(300); settleDock();
+            if (!InjectWidget(dockFrame)) throw std::runtime_error("Theme-switch reinjection failed");
+            settleDock();
             double dockWidth = dockRoot.ActualWidth(), dockMargin = dockButtons.Margin().Left;
             settleDock();
             if (std::abs(dockRoot.ActualWidth() - dockWidth) > .1 ||
